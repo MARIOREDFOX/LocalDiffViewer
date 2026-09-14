@@ -1,0 +1,1085 @@
+id: process-ticket
+namespace: aira.orchestrator
+description: >
+  One ticket in, one outcome out. Called by poll-servicenow for every new
+  ticket. Calls AIRA's POST /api/orchestrator/classify for both the
+  Catalog Request path (deterministic, no AI, on the AIRA side) and the
+  Incident/General Request path (AIRA's real LLM classifier) -- AIRA
+  answers "what should run, with what params, does it need approval, and
+  which exact Kestra namespace/flow" and touches nothing else.
+
+  Dispatch is a static Switch (run_automation's dispatch_switch task),
+  one literal case per known aira.automations flow -- NOT a single
+  Subflow task with namespace/flowId both templated from AIRA's
+  response. That fully-dynamic version was tried first and reverted:
+  it's the pattern shown in every Kestra tutorial, but confirmed
+  unreliable in practice here -- identical revisions of both this flow
+  and the dispatched automation produced different outcomes across
+  independent runs (params_json arriving intact on one run, silently
+  empty on another), which a side-by-side Revision diff ruled out as a
+  stale/unsaved-flow explanation. A static namespace/flowId per case is
+  the pattern every official Kestra example uses when a typed (non-
+  STRING) input must reach a subflow reliably. THE TRADE-OFF: adding a
+  new Kestra-dispatched automation in AIRA's Automations page now also
+  requires adding a matching case to dispatch_switch below and
+  redeploying this flow -- it's no longer a zero-edit, AIRA-only change.
+  An automation matched by AIRA with no corresponding case here hits
+  dispatch_switch's defaults: branch, which reports it to AIRA as a
+  clear, specific failure rather than silently doing nothing.
+
+inputs:
+  - id: sys_id
+    type: STRING
+    required: true
+  - id: table
+    type: STRING
+    required: true
+  - id: number
+    type: STRING
+    required: true
+  - id: short_description
+    type: STRING
+    required: false
+  - id: catalog_item
+    type: STRING
+    required: false
+    description: Set only for Catalog Requests (sc_req_item). Empty for Incidents/General Requests.
+  - id: approval_poll_seconds
+    type: INT
+    required: true
+    defaults: 30
+  - id: approval_timeout_hours
+    type: INT
+    required: true
+    defaults: 72
+
+tasks:
+  - id: match_automation
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    beforeCommands:
+      - pip install kestra requests --break-system-packages
+    env:
+      CATALOG_ITEM: "{{ inputs.catalog_item ?? '' }}"
+      NUMBER: "{{ inputs.number }}"
+      SHORT_DESC: "{{ inputs.short_description ?? '' }}"
+      SYS_ID: "{{ inputs.sys_id ?? '' }}"
+      SN_URL: "{{ kv('SN_URL') }}"
+      SN_USERNAME: "{{ kv('SN_USERNAME') }}"
+      SN_PASSWORD: "{{ kv('SN_PASSWORD') }}"
+      AIRA_URL: "{{ kv('AIRA_URL') }}"
+      AIRA_ORCHESTRATOR_KEY: "{{ kv('AIRA_ORCHESTRATOR_KEY') }}"
+    script: |
+      import os, json, requests
+      from kestra import Kestra
+
+      catalog_item = os.environ.get("CATALOG_ITEM", "").strip()
+      short_desc = os.environ.get("SHORT_DESC", "")
+      sys_id = os.environ["SYS_ID"]
+      if not sys_id:
+          # sys_id is a required input with no default -- normally
+          # Kestra itself refuses to even start an execution missing it,
+          # and reports a generic "Unable to find `sys_id` used in the
+          # expression" error at render time, before this script ever
+          # runs. This explicit check exists for the one case that
+          # error doesn't explain itself: this flow is only ever meant
+          # to be dispatched as a subflow, by 1-poll-servicenow.yml's
+          # ForEach, which always supplies a real ticket's sys_id -- if
+          # you're seeing THIS message instead of Kestra's own render
+          # error, you're most likely looking at a manual "Execute" (or
+          # a Retry of one) on process-ticket directly, with sys_id left
+          # blank in the input form. Fill in a real sys_id/table/number
+          # from an actual ServiceNow ticket, or better, just create a
+          # real test ticket and let the poller dispatch this flow
+          # naturally instead of executing it standalone.
+          raise ValueError(
+              "sys_id is empty. process-ticket is meant to be dispatched by "
+              "1-poll-servicenow.yml with a real ticket's sys_id/table/number -- "
+              "if you're testing this flow directly via Execute, fill in those "
+              "three fields with real values from an actual ServiceNow ticket."
+          )
+      sn_base = os.environ["SN_URL"].replace("__AIRA_COLON__", ":").replace("__AIRA_SLASH__", "/").rstrip("/")  # AIRA may push URLs colon-encoded around a Kestra KV Store bug -- see kestra_agent.py set_kv()
+      sn_auth = (os.environ["SN_USERNAME"], os.environ["SN_PASSWORD"])
+      aira_url = os.environ["AIRA_URL"].replace("__AIRA_COLON__", ":").replace("__AIRA_SLASH__", "/").rstrip("/")  # AIRA may push URLs colon-encoded around a Kestra KV Store bug -- see kestra_agent.py set_kv()
+      orchestrator_key = os.environ["AIRA_ORCHESTRATOR_KEY"]
+
+      def _dotwalk(row, path):
+          """sysparm_display_value=all returns dot-walked fields as
+          {"display_value": ..., "value": ...} objects. Plain fields
+          (no dot-walk) come back as bare strings. Handle both."""
+          field = row.get(path)
+          if isinstance(field, dict):
+              return field.get("value"), field.get("display_value")
+          return field, field
+
+      def _looks_like_sys_id(value):
+          value = (value or "").strip().lower()
+          return len(value) == 32 and all(c in "0123456789abcdef" for c in value)
+
+      def resolve_identity(value, reference_table=None):
+          """A reference-type variable's raw value is the referenced
+          record's sys_id, not anything usable as a UPN (e.g. "Contractor
+          to Offboard" is a reference field; its raw value is a sys_id,
+          its display_value is a human name like "user03 test" -- neither
+          is the email an Azure UPN check needs). Only sys_id-shaped raw
+          values get resolved; anything already email-shaped, or not a
+          variable AIRA cares about, is left as-is.
+
+          reference_table comes from the variable's own definition
+          (item_option_new.reference) rather than being assumed to always
+          be sys_user -- confirmed live that assumption was wrong for at
+          least one instance (a sys_user lookup 404'd on a real reference
+          sys_id), so the actual target table is looked up per-variable
+          instead of hardcoded.
+
+          The candidate field list below is intentionally broader than
+          just sys_user's own shape (email/user_name/name) -- confirmed
+          live against a genuinely different custom reference table
+          (u_azure_resource_types, backing the "Resource Type" variant
+          field): the lookup itself succeeded (a real record was found),
+          but NONE of those three fields existed on it, so the old code
+          fell through to an empty string and silently discarded even
+          the raw sys_id, which is strictly worse than the exception
+          path below (which at least preserves it). Now: (1) try a
+          wider set of common ServiceNow display-field conventions with
+          sysparm_display_value=all, so a choice/reference field used AS
+          a display name (e.g. u_name pointing at another reference)
+          still resolves to readable text rather than another sys_id,
+          and (2) if genuinely nothing usable comes back, fall back to
+          the raw sys_id rather than "" -- AIRA showing a raw sys_id in
+          a Parameter Mapping is at least visible and debuggable; a
+          silent empty string looks identical to "the requester left
+          this blank," which it demonstrably was not."""
+          value = (value or "").strip()
+          if not value or "@" in value or not _looks_like_sys_id(value):
+              return value
+          table = (reference_table or "").strip() or "sys_user"
+          candidate_fields = [
+              "email", "user_name", "name", "u_name", "label", "title", "display_name", "short_description",
+              # Confirmed live: this org's custom reference tables use a
+              # "u_<concept matching the table's own name>" convention,
+              # not a generic name/label field -- u_azure_resource_types'
+              # actual display field is u_resource_type, discovered
+              # directly from the full-record dump this function now
+              # prints on a miss. u_subscription/u_subscription_name are
+              # the same convention applied to u_azure_subscriptions,
+              # which was STILL unresolved in that same test (came back
+              # as a raw sys_id too) -- these are an educated guess
+              # following the same pattern, not yet independently
+              # confirmed the way u_resource_type was. If this org has
+              # more custom Azure reference tables (e.g. a future
+              # u_azure_regions), expect the same "u_<concept>" pattern
+              # and add it here directly once confirmed via this same
+              # function's own diagnostic dump on a miss.
+              "u_resource_type", "u_subscription", "u_subscription_name",
+          ]
+          try:
+              # No sysparm_fields restriction -- confirmed live that
+              # restricting to the candidate list meant a genuine miss
+              # (u_azure_resource_types/u_azure_subscriptions, neither
+              # of which use any of the 8 guessed names) gave zero
+              # visibility into what the record's ACTUAL fields even
+              # are, forcing another guess-a-name-and-redeploy round
+              # trip. Fetching the whole record costs one extra bit of
+              # payload size and lets a genuine miss print every real
+              # field name/value ServiceNow has on it in one shot --
+              # the exact field to add to candidate_fields above is
+              # then directly visible in this task's own Kestra log,
+              # no further guessing needed.
+              r = requests.get(
+                  f"{sn_base}/api/now/table/{table}/{value}",
+                  auth=sn_auth, headers={"Accept": "application/json"},
+                  params={"sysparm_display_value": "all"},
+                  timeout=30,
+              )
+              r.raise_for_status()
+              rec = r.json().get("result", {})
+              for field in candidate_fields:
+                  resolved_value, resolved_display = _dotwalk(rec, field)
+                  # Prefer the DISPLAY value when the field itself is a
+                  # dot-walked reference/choice (dict shape) -- e.g. a
+                  # custom table whose own "name" is itself a choice
+                  # list would otherwise resolve to an internal choice
+                  # value rather than the human-readable label.
+                  candidate = (resolved_display or resolved_value or "").strip()
+                  if candidate:
+                      return candidate
+              # Flatten dot-walked {"value":...,"display_value":...}
+              # fields down to just their display_value for a clean,
+              # readable dump -- the raw nested shape is noisy and
+              # not what you'd type into candidate_fields anyway.
+              readable_rec = {
+                  k: (v.get("display_value") if isinstance(v, dict) else v)
+                  for k, v in rec.items()
+              }
+              print(
+                  f"{table} record {value!r} found, but none of {candidate_fields} had a usable "
+                  f"value on it -- leaving raw sys_id as-is so this is at least visible, not "
+                  f"silently empty. Full record for reference (pick the right field name and add "
+                  f"it to candidate_fields above): {readable_rec}"
+              )
+              return value
+          except Exception as e:
+              print(f"{table} lookup failed for {value!r}: {e} -- leaving raw value as-is.")
+              return value
+
+      def fetch_ritm_variables(request_item_sys_id):
+          """Real RITM variable extraction via sc_item_option_mtom, replacing
+          the earlier short_description text-parsing placeholder -- that
+          approach silently produced {} for any catalog item whose RITMs
+          don't carry a free-text short_description at all (confirmed
+          live: RITM0010061 has no short_description whatsoever, only its
+          structured form variables).
+
+          Keys are the variable's QUESTION LABEL (item_option_new.
+          question_text, e.g. "Contractor to Offboard"), used byte-for-
+          byte as-is -- NOT the internal machine name, and NOT
+          lowercased/underscored. AIRA's own resolve_field_value() does a
+          plain `extracted_fields.get(field_name, "")`, where field_name
+          is whatever exact string is typed into that automation's
+          Parameter Mapping "field" value in the AIRA UI (confirmed
+          directly against prediction_service.py -- no normalization on
+          AIRA's side at all). Keying by a normalized machine name here
+          silently produced an all-empty params dict against every field,
+          not just the reference one -- confirmed live, this was the
+          actual reason match_automation reported the field missing even
+          though the RITM plainly had it filled in.
+
+          sysparm_display_value=all pulls both the raw stored value and
+          the human-readable display value in one call, and
+          item_option_new.reference gives the actual target table for
+          reference-type variables, so resolve_identity() above doesn't
+          have to guess."""
+          resp = requests.get(
+              f"{sn_base}/api/now/table/sc_item_option_mtom",
+              auth=sn_auth, headers={"Accept": "application/json"},
+              params={
+                  "sysparm_query": f"request_item={request_item_sys_id}",
+                  "sysparm_fields": (
+                      "sc_item_option.item_option_new.question_text,"
+                      "sc_item_option.item_option_new.reference,"
+                      "sc_item_option.value"
+                  ),
+                  "sysparm_display_value": "all",
+              },
+              timeout=30,
+          )
+          resp.raise_for_status()
+          variables = {}
+          for row in resp.json().get("result", []):
+              _, label = _dotwalk(row, "sc_item_option.item_option_new.question_text")
+              ref_table, _ = _dotwalk(row, "sc_item_option.item_option_new.reference")
+              raw_value, _display_value = _dotwalk(row, "sc_item_option.value")
+              label = (label or "").strip()
+              if not label:
+                  continue
+              variables[label] = resolve_identity(raw_value, ref_table)
+          return variables
+
+      if catalog_item:
+          fields = fetch_ritm_variables(sys_id)
+      else:
+          # Free-text path (Incidents/General Requests) has no RITM
+          # variables to look up -- keep the "Label: value" parse here,
+          # it's still the right approach for genuinely free-text tickets.
+          # Key case/spacing preserved as typed, NOT lowercased -- same
+          # reasoning as fetch_ritm_variables above: AIRA's
+          # resolve_field_value() does an exact `extracted_fields.get(
+          # field_name, "")` against whatever string is literally
+          # configured in that automation's Parameter Mapping, with zero
+          # normalization on its side. A lowercased key here would only
+          # match a Parameter Mapping "field" value that happens to also
+          # be all-lowercase.
+          fields = {}
+          for segment in short_desc.split(". "):
+              if ":" in segment:
+                  key, _, val = segment.partition(":")
+                  fields[key.strip()] = val.strip()
+
+      # THE INPUTS DEBUG PRINT -- exactly what this ticket actually gave
+      # us, fully resolved (reference fields already turned into
+      # readable text by resolve_identity above), right before it's
+      # sent to AIRA. This is the single most useful line in this whole
+      # task for diagnosing a "why didn't this map correctly" question --
+      # it's the ground truth of what AIRA's Parameter Mapping "field"
+      # values are actually being matched against. Look for this exact
+      # line in match_automation's own Kestra log.
+      print(f"Ticket variables captured for {os.environ['NUMBER']} ({sys_id}): {json.dumps(fields, indent=2)}")
+
+      body = {"catalog_item": catalog_item, "variables": fields} if catalog_item \
+          else {"short_description": short_desc}
+
+      resp = requests.post(
+          f"{aira_url}/api/orchestrator/classify",
+          headers={"X-Orchestrator-Key": orchestrator_key, "Accept": "application/json"},
+          json=body, timeout=30,
+      )
+      if resp.status_code == 401:
+          raise Exception("AIRA rejected X-Orchestrator-Key -- check the AIRA_ORCHESTRATOR_KEY KV value matches AIRA's AIRA_ORCHESTRATOR_API_KEY.")
+      if resp.status_code == 503:
+          raise Exception("AIRA's orchestrator API isn't configured (AIRA_ORCHESTRATOR_API_KEY unset on the AIRA side).")
+      if resp.status_code >= 400:
+          # raise_for_status() alone gives a bare "400 Client Error: BAD
+          # REQUEST for url: ..." with NO indication of what AIRA's error
+          # message actually said -- confirmed live, this exact gap cost
+          # a full extra round-trip to diagnose. AIRA's /classify always
+          # returns a JSON body with a real "error" key on 4xx; surface
+          # it directly, and include exactly what was sent so a bad
+          # request body is obvious at a glance too.
+          try:
+              detail = resp.json().get("error", resp.text)
+          except ValueError:
+              detail = resp.text
+          raise Exception(f"AIRA rejected the classify request (HTTP {resp.status_code}): {detail} -- body sent: {json.dumps(body)}")
+      resp.raise_for_status()
+      classification = resp.json()
+
+      # AIRA's response shape: {matched, intent, kestra_namespace,
+      # kestra_flow_id, approval_required, params, confidence,
+      # assignment_group, reason, explanation, confidence_score,
+      # match_count, similar_tickets, from_cache}. kestra_flow_id is
+      # what run_automation's dispatch_switch task below matches against
+      # to pick which of its static, literal per-automation cases to
+      # run (see that task's own comments for why this is no longer a
+      # single fully-dynamic Subflow task). kestra_namespace is carried
+      # through mainly for visibility/debugging -- every current case in
+      # that Switch hardcodes namespace: aira.automations directly,
+      # since every known automation lives there. explanation/
+      # confidence_score/match_count/similar_tickets/from_cache are the
+      # ONE real LLM classification call's own output (null for a
+      # catalog_item ticket, which never goes through the LLM) --
+      # captured here and forwarded by report_processing below so AIRA
+      # can store them once and never needs to re-run the classifier
+      # just to display them again.
+      result = {
+          "matched": bool(classification.get("matched")),
+          "intent": classification.get("intent"),
+          "kestra_namespace": classification.get("kestra_namespace") or "",
+          "kestra_flow_id": classification.get("kestra_flow_id") or "",
+          "approval_required": bool(classification.get("approval_required")),
+          "assignment_group": classification.get("assignment_group") or "",
+          "params": classification.get("params") or {},
+          "reason": classification.get("reason"),
+          "explanation": classification.get("explanation"),
+          "confidence_score": classification.get("confidence_score"),
+          "match_count": classification.get("match_count"),
+          "similar_tickets": classification.get("similar_tickets") or [],
+          "from_cache": bool(classification.get("from_cache")),
+      }
+      Kestra.outputs(result)
+      print(json.dumps(result))
+
+  # Reports the ticket to AIRA's Ticket History RIGHT NOW, the moment
+  # classification finishes -- not just at write_back, minutes or hours
+  # later, once approval/execution has fully settled. Without this, a
+  # ticket sitting in needs_approval for however long a human takes was
+  # completely invisible on Ticket History, even though it was already
+  # visible on the Approvals page -- confirmed live: RITM0010109 showed
+  # up under Pending in Approvals but nowhere in Ticket History at all.
+  #
+  # kestra_execution_id/namespace/flow_id sent here are THIS orchestrator
+  # execution's own identity ({{ execution.id }} / {{ flow.namespace }} /
+  # {{ flow.id }}) -- deliberately NOT the matched automation's
+  # namespace/flow_id. This one Kestra execution's own Gantt already
+  # covers the entire pipeline end to end (match_automation ->
+  # needs_approval -> run_automation's dispatched subflow, shown nested
+  # -> write_back), so it's the single most useful execution for AIRA to
+  # point a live status view at from the moment a ticket starts
+  # processing all the way through to the end -- see write_back below,
+  # which reports this same execution id again rather than switching to
+  # the dispatched automation's own, narrower one.
+  - id: report_processing
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    beforeCommands:
+      - pip install requests --break-system-packages
+    env:
+      AIRA_URL: "{{ kv('AIRA_URL') }}"
+      AIRA_ORCHESTRATOR_KEY: "{{ kv('AIRA_ORCHESTRATOR_KEY') }}"
+      NUMBER: "{{ inputs.number }}"
+      TABLE: "{{ inputs.table }}"
+      SHORT_DESCRIPTION: "{{ inputs.short_description ?? '' }}"
+      INTENT: "{{ outputs.match_automation.vars.intent ?? '' }}"
+      ASSIGNMENT_GROUP: "{{ outputs.match_automation.vars.assignment_group ?? '' }}"
+      # The one real LLM classification call's own output -- see
+      # match_automation's own result dict above and
+      # prediction_service.py's classify_for_orchestrator. Empty/blank
+      # for a catalog_item ticket, which never goes through the LLM.
+      # Forwarded here, once, so AIRA can store it against this ticket
+      # and the Ticket Detail page never needs to re-run the classifier
+      # just to display it.
+      EXPLANATION: "{{ outputs.match_automation.vars.explanation ?? '' }}"
+      CONFIDENCE_SCORE: "{{ outputs.match_automation.vars.confidence_score ?? '' }}"
+      MATCH_COUNT: "{{ outputs.match_automation.vars.match_count ?? '' }}"
+      SIMILAR_TICKETS_JSON: "{{ outputs.match_automation.vars.similar_tickets ?? '' }}"
+      FROM_CACHE: "{{ outputs.match_automation.vars.from_cache ?? '' }}"
+      EXECUTION_ID: "{{ execution.id }}"
+      FLOW_NAMESPACE: "{{ flow.namespace }}"
+      FLOW_ID: "{{ flow.id }}"
+    script: |
+      import os, json, requests
+      base = os.environ["AIRA_URL"].replace("__AIRA_COLON__", ":").replace("__AIRA_SLASH__", "/").rstrip("/")  # AIRA may push URLs colon-encoded around a Kestra KV Store bug -- see kestra_agent.py set_kv()
+      confidence_score_raw = os.environ.get("CONFIDENCE_SCORE", "")
+      match_count_raw = os.environ.get("MATCH_COUNT", "")
+      try:
+          similar_tickets = json.loads(os.environ.get("SIMILAR_TICKETS_JSON", "") or "[]")
+          if not isinstance(similar_tickets, list):
+              similar_tickets = []
+      except (ValueError, TypeError):
+          similar_tickets = []
+      try:
+          resp = requests.post(
+              f"{base}/api/orchestrator/report",
+              headers={"X-Orchestrator-Key": os.environ["AIRA_ORCHESTRATOR_KEY"], "Accept": "application/json"},
+              json={
+                  "ticket_id": os.environ["NUMBER"],
+                  "table": os.environ["TABLE"],
+                  "short_description": os.environ["SHORT_DESCRIPTION"],
+                  "assignment_group": os.environ["ASSIGNMENT_GROUP"],
+                  "intent": os.environ["INTENT"] or None,
+                  "status": "processing",
+                  "kestra_execution_id": os.environ["EXECUTION_ID"],
+                  "kestra_namespace": os.environ["FLOW_NAMESPACE"],
+                  "kestra_flow_id": os.environ["FLOW_ID"],
+                  "explanation": os.environ.get("EXPLANATION") or None,
+                  "confidence_score": float(confidence_score_raw) if confidence_score_raw else None,
+                  "match_count": int(match_count_raw) if match_count_raw else None,
+                  "similar_tickets": similar_tickets,
+                  "from_cache": os.environ.get("FROM_CACHE", "").strip().lower() == "true",
+              },
+              timeout=15,
+          )
+          if not (resp.status_code == 200 and resp.json().get("recorded")):
+              print(f"AIRA did not confirm the 'processing' report for {os.environ['NUMBER']} -- HTTP {resp.status_code}: {resp.text[:500]}")
+      except Exception as e:
+          print(f"Reporting 'processing' status to AIRA failed (non-fatal, classification/dispatch below proceeds regardless): {e}")
+
+  - id: update_assignment_group
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    beforeCommands:
+      - pip install requests --break-system-packages
+    env:
+      SN_URL: "{{ kv('SN_URL') }}"
+      SN_USERNAME: "{{ kv('SN_USERNAME') }}"
+      SN_PASSWORD: "{{ kv('SN_PASSWORD') }}"
+      SYS_ID: "{{ inputs.sys_id }}"
+      TABLE: "{{ inputs.table }}"
+      GROUP: "{{ outputs.match_automation.vars.assignment_group }}"
+    script: |
+      import os, requests
+      # Deliberately NOT gated on whether an automation matched -- a
+      # ticket AIRA classified but has no registered automation for
+      # still deserves to land on the right team's queue rather than sit
+      # unrouted. Routing (classification) and automation-dispatch
+      # (whether a workflow exists to run) are two independent outcomes
+      # of the same classify call; only automation-dispatch depends on a
+      # match existing. GROUP itself is only non-empty when
+      # classification actually produced a routing signal (see
+      # classify_for_orchestrator's own docstring on assignment_group),
+      # so the empty-check alone is the correct, sufficient gate here.
+      if not os.environ["GROUP"]:
+          print("No assignment_group signal for this ticket (e.g. a Catalog Request path, which doesn't produce one) -- leaving it untouched.")
+      else:
+          base = os.environ["SN_URL"].replace("__AIRA_COLON__", ":").replace("__AIRA_SLASH__", "/").rstrip("/")  # AIRA may push URLs colon-encoded around a Kestra KV Store bug -- see kestra_agent.py set_kv()
+          auth = (os.environ["SN_USERNAME"], os.environ["SN_PASSWORD"])
+          resp = requests.patch(
+              f"{base}/api/now/table/{os.environ['TABLE']}/{os.environ['SYS_ID']}",
+              auth=auth, headers={"Accept": "application/json"},
+              params={"sysparm_input_display_value": "true"},
+              json={"assignment_group": os.environ["GROUP"]},
+              timeout=30,
+          )
+          resp.raise_for_status()
+          print(f"Assignment group set to {os.environ['GROUP']}")
+
+  - id: needs_approval
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.match_automation.vars.matched == true and outputs.match_automation.vars.approval_required == true }}"
+    then:
+      - id: note_pending_approval
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        beforeCommands:
+          - pip install requests --break-system-packages
+        env:
+          SN_URL: "{{ kv('SN_URL') }}"
+          SN_USERNAME: "{{ kv('SN_USERNAME') }}"
+          SN_PASSWORD: "{{ kv('SN_PASSWORD') }}"
+          SYS_ID: "{{ inputs.sys_id }}"
+          TABLE: "{{ inputs.table }}"
+          NUMBER: "{{ inputs.number }}"
+          SHORT_DESCRIPTION: "{{ inputs.short_description ?? '' }}"
+          INTENT: "{{ outputs.match_automation.vars.intent ?? '' }}"
+          PARAMS_JSON: "{{ outputs.match_automation.vars.params ?? '' }}"
+          # This orchestrator execution's own identity, same as
+          # report_processing above -- NOT the matched automation's
+          # namespace/flow_id. It's still this same execution that's
+          # actually "in flight" right now (sitting in
+          # wait_for_servicenow_approval below), so it's what AIRA's
+          # live status view should keep pointing at.
+          EXECUTION_ID: "{{ execution.id }}"
+          FLOW_NAMESPACE: "{{ flow.namespace }}"
+          FLOW_ID: "{{ flow.id }}"
+          AIRA_URL: "{{ kv('AIRA_URL') }}"
+          AIRA_ORCHESTRATOR_KEY: "{{ kv('AIRA_ORCHESTRATOR_KEY') }}"
+        script: |
+          import os, json, requests
+          base = os.environ["SN_URL"].replace("__AIRA_COLON__", ":").replace("__AIRA_SLASH__", "/").rstrip("/")  # AIRA may push URLs colon-encoded around a Kestra KV Store bug -- see kestra_agent.py set_kv()
+          auth = (os.environ["SN_USERNAME"], os.environ["SN_PASSWORD"])
+          requests.patch(
+              f"{base}/api/now/table/{os.environ['TABLE']}/{os.environ['SYS_ID']}",
+              auth=auth, headers={"Accept": "application/json"},
+              json={"work_notes": "[Kestra] Pending approval -- approve this in ServiceNow itself, or from AIRA's own Approvals page. Either one will start the automation automatically."},
+              timeout=30,
+          ).raise_for_status()
+
+          # Tell AIRA an approval is now in flight -- without this call,
+          # AIRA's Approvals page has zero visibility into this ticket
+          # until process-ticket finishes entirely at write_back, which
+          # could be minutes or hours later depending on how long the
+          # human takes to approve in ServiceNow. This is the ONLY thing
+          # that makes a Kestra-driven approval show up on AIRA's own
+          # Approvals page -- without it the ticket sits genuinely
+          # pending in ServiceNow/Kestra (wait_for_servicenow_approval
+          # really is RUNNING) while AIRA shows "0 pending" the entire
+          # time, which looks exactly like nothing is happening.
+          # Best-effort and non-fatal: a failure here never blocks the
+          # actual approval wait below.
+          try:
+              params = json.loads(os.environ.get("PARAMS_JSON", "") or "{}")
+          except (ValueError, TypeError):
+              params = {}
+          try:
+              resp = requests.post(
+                  f"{os.environ['AIRA_URL'].replace('__AIRA_COLON__', ':').replace('__AIRA_SLASH__', '/').rstrip('/')}/api/orchestrator/approval-pending",
+                  headers={"X-Orchestrator-Key": os.environ["AIRA_ORCHESTRATOR_KEY"], "Accept": "application/json"},
+                  json={
+                      "ticket_id": os.environ["NUMBER"],
+                      "table": os.environ["TABLE"],
+                      "sys_id": os.environ["SYS_ID"],
+                      "short_description": os.environ["SHORT_DESCRIPTION"],
+                      "intent": os.environ.get("INTENT") or None,
+                      "kestra_execution_id": os.environ["EXECUTION_ID"],
+                      "kestra_namespace": os.environ["FLOW_NAMESPACE"],
+                      "kestra_flow_id": os.environ["FLOW_ID"],
+                      "params": params,
+                  },
+                  timeout=15,
+              )
+              # requests.post() does NOT raise for a plain HTTP error
+              # response (401, 500, etc.) -- only for a connection-level
+              # failure. Printing every outcome, success included, so a
+              # wrong AIRA_ORCHESTRATOR_KEY or a 500 on AIRA's side shows
+              # up in this task's own logs instead of vanishing silently.
+              if resp.status_code == 200 and resp.json().get("recorded"):
+                  print(f"AIRA notified of pending approval for {os.environ['NUMBER']} (approval_id={resp.json().get('approval_id')}).")
+              else:
+                  print(f"AIRA did not confirm the pending-approval notification for {os.environ['NUMBER']} -- HTTP {resp.status_code}: {resp.text[:500]}")
+          except Exception as e:
+              print(f"Notifying AIRA of pending approval failed (non-fatal, the approval wait below proceeds regardless): {e}")
+
+      - id: wait_for_servicenow_approval
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        beforeCommands:
+          - pip install kestra requests --break-system-packages
+        env:
+          SN_URL: "{{ kv('SN_URL') }}"
+          SN_USERNAME: "{{ kv('SN_USERNAME') }}"
+          SN_PASSWORD: "{{ kv('SN_PASSWORD') }}"
+          SYS_ID: "{{ inputs.sys_id }}"
+          TABLE: "{{ inputs.table }}"
+          POLL_SECONDS: "{{ inputs.approval_poll_seconds }}"
+          TIMEOUT_HOURS: "{{ inputs.approval_timeout_hours }}"
+        script: |
+          import os, time, requests
+          from kestra import Kestra
+
+          base = os.environ["SN_URL"].replace("__AIRA_COLON__", ":").replace("__AIRA_SLASH__", "/").rstrip("/")  # AIRA may push URLs colon-encoded around a Kestra KV Store bug -- see kestra_agent.py set_kv()
+          auth = (os.environ["SN_USERNAME"], os.environ["SN_PASSWORD"])
+          sys_id, table = os.environ["SYS_ID"], os.environ["TABLE"]
+          poll_seconds = int(os.environ["POLL_SECONDS"])
+          deadline = time.time() + int(os.environ["TIMEOUT_HOURS"]) * 3600
+
+          def get_approval_state():
+              try:
+                  r = requests.get(
+                      f"{base}/api/now/table/{table}/{sys_id}",
+                      auth=auth, headers={"Accept": "application/json"},
+                      params={"sysparm_fields": "approval"}, timeout=30,
+                  )
+                  r.raise_for_status()
+                  native = (r.json().get("result", {}).get("approval") or "").strip().lower()
+                  if native in ("approved", "rejected"):
+                      return native
+              except Exception as e:
+                  print(f"native approval field check failed: {e}")
+
+              try:
+                  r = requests.get(
+                      f"{base}/api/now/table/sysapproval_approver",
+                      auth=auth, headers={"Accept": "application/json"},
+                      params={"sysparm_query": f"sysapproval={sys_id}", "sysparm_fields": "state"},
+                      timeout=30,
+                  )
+                  r.raise_for_status()
+                  states = [(row.get("state") or "").strip().lower() for row in r.json().get("result", [])]
+                  if not states:
+                      return "pending"
+                  if "rejected" in states:
+                      return "rejected"
+                  relevant = [s for s in states if s != "cancelled"]
+                  if relevant and all(s == "approved" for s in relevant):
+                      return "approved"
+                  return "pending"
+              except Exception as e:
+                  print(f"sysapproval_approver check failed: {e}")
+                  return "pending"
+
+          state = "pending"
+          while time.time() < deadline:
+              state = get_approval_state()
+              if state in ("approved", "rejected"):
+                  break
+              time.sleep(poll_seconds)
+
+          Kestra.outputs({"approval_state": state})
+          print(f"Final approval state: {state}")
+
+  # STATIC per-automation dispatch via Switch -- NOT fully dynamic
+  # anymore. This is a deliberate architecture change from the earlier
+  # "one Subflow task, namespace/flowId both templated straight from
+  # AIRA's response, works for any automation with zero edits here"
+  # design. That design was correct in intent, but empirical testing
+  # found it genuinely unreliable in practice: two independent live
+  # runs against the IDENTICAL revision of both this flow and the
+  # target automation produced different outcomes (one successful
+  # dispatch, one with params_json silently arriving empty) -- ruled
+  # out a stale/unsaved revision (a side-by-side Revision diff showed
+  # the target's inputs: block byte-for-byte identical across the
+  # revision in question) and ruled out unfiltered object
+  # interpolation (added the toJson filter -- still failed
+  # intermittently afterward). Every official Kestra example that
+  # reliably passes a typed (non-STRING) input to a Subflow uses a
+  # STATIC, literal namespace/flowId -- none combine both fields being
+  # simultaneously templated with a typed object input. That specific
+  # combination is the one variable that's changed here: each case
+  # below has a literal namespace/flowId now, everything else
+  # (allowFailure/transmitFailed/retry/params_json via toJson) is
+  # unchanged from the fully-dynamic version.
+  #
+  # THE TRADE-OFF, STATED PLAINLY: adding a new Kestra-dispatched
+  # automation in AIRA's Automations page is NO LONGER sufficient by
+  # itself -- a matching case must also be added below, or that
+  # automation will hit `defaults:` and be reported to AIRA as
+  # "failed" with a clear reason, not silently dropped. This directly
+  # reverses this flow's own original design goal (see the top-of-file
+  # description, which still describes the old fully-dynamic
+  # behavior -- update it if you're reading this after also updating
+  # that) -- accepted deliberately in favor of actually working
+  # reliably, since the fully-dynamic version could not be made
+  # reliable despite multiple genuine attempts (toJson, retry,
+  # transmitFailed) each targeting a real, confirmed issue without
+  # resolving the core one.
+  - id: run_automation
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.match_automation.vars.matched == true and (outputs.match_automation.vars.approval_required != true or (outputs.wait_for_servicenow_approval.vars.approval_state ?? '') == 'approved') }}"
+    then:
+      # WORKAROUND, not a guess this time -- every other explanation was
+      # directly disproven by live evidence: stale/unsaved revision
+      # (ruled out via a side-by-side Revision diff, byte-identical
+      # inputs: block across revisions, and Revision 7 confirmed
+      # unchanged for 16+ hours across multiple failing test runs),
+      # dynamic namespace+flowId (ruled out -- switched to a fully
+      # static Switch dispatch below, still failed identically, with
+      # the warning itself now showing the real resolved flow name, not
+      # a template), and toJson/double-encoding (ruled out -- a debug
+      # Log task printed the exact literal value being sent, and it was
+      # perfectly valid, correctly-shaped JSON, identical with or
+      # without the filter). With every plausible AIRA-side explanation
+      # exhausted, this looks like a genuine, unresolved defect in
+      # Kestra's own binding of a type: JSON Subflow input -- so rather
+      # than keep guessing at why that specific mechanism fails, this
+      # sidesteps it entirely: the resolved params are staged in
+      # Kestra's KV store under a key unique to this execution, and
+      # each target flow receives only a plain STRING input (this
+      # execution's own id) to look that key up itself. Every STRING
+      # input in this whole flow (sys_id, table, number, catalog_item,
+      # kestra_flow_id via the Switch's own value, etc.) has worked
+      # reliably in every single test throughout this entire
+      # investigation -- only the one JSON-typed input has ever failed.
+      # Staged under the shared "aira" namespace (a still-explicit
+      # namespace, not relying on Kestra's own parent-namespace
+      # fallback for kv()) so both this flow (aira.orchestrator) and
+      # every target flow (aira.automations) can read the exact same
+      # key without ambiguity.
+      - id: stage_params_in_kv
+        type: io.kestra.plugin.core.kv.Set
+        key: "params_json_{{ execution.id }}"
+        namespace: aira
+        value: "{{ outputs.match_automation.vars.params | toJson }}"
+      # Each case below uses its OWN distinct task id (dispatch_azure_
+      # user_disable, not a shared dispatch_to_matched_automation
+      # reused across cases) -- no official Kestra example demonstrates
+      # reusing one task id across mutually-exclusive branches, and
+      # rather than assume that's safe (risking a save-time validation
+      # error), write_back's own RUN_STATE capture below chains ??
+      # across all three possible outputs instead -- the exact same
+      # null-coalescing pattern already used throughout this file for
+      # "this task may not have run at all" (e.g.
+      # wait_for_servicenow_approval's own approval_state lookup).
+      - id: dispatch_switch
+        type: io.kestra.plugin.core.flow.Switch
+        value: "{{ outputs.match_automation.vars.kestra_flow_id }}"
+        cases:
+          azure-user-disable:
+            - id: dispatch_azure_user_disable
+              type: io.kestra.plugin.core.flow.Subflow
+              namespace: aira.automations
+              flowId: azure-user-disable
+              wait: true
+              retry:
+                type: constant
+                maxAttempts: 3
+                interval: PT10S
+                warningOnRetry: true
+              allowFailure: true
+              transmitFailed: true
+              inputs:
+                parent_execution_id: "{{ execution.id }}"
+          azure-user-create:
+            - id: dispatch_azure_user_create
+              type: io.kestra.plugin.core.flow.Subflow
+              namespace: aira.automations
+              flowId: azure-user-create
+              wait: true
+              retry:
+                type: constant
+                maxAttempts: 3
+                interval: PT10S
+                warningOnRetry: true
+              allowFailure: true
+              transmitFailed: true
+              inputs:
+                parent_execution_id: "{{ execution.id }}"
+          add-user-to-shared-mailbox:
+            - id: dispatch_add_user_to_shared_mailbox
+              type: io.kestra.plugin.core.flow.Subflow
+              namespace: aira.automations
+              flowId: add-user-to-shared-mailbox
+              wait: true
+              retry:
+                type: constant
+                maxAttempts: 3
+                interval: PT10S
+                warningOnRetry: true
+              allowFailure: true
+              transmitFailed: true
+              inputs:
+                parent_execution_id: "{{ execution.id }}"
+          # Azure Resource Request's three Resource Type variants (see
+          # AIRA's Automation Variants for azure_resource_request) --
+          # added after the original three cases above; this Switch
+          # needing a matching case per target flow is the documented,
+          # deliberate trade-off of the static-dispatch design (see this
+          # task's own top comment) -- confirmed live: the very first
+          # real ticket through a newly-added variant hit exactly the
+          # defaults: branch below until these were added.
+          azure-resource-group-create:
+            - id: dispatch_azure_resource_group_create
+              type: io.kestra.plugin.core.flow.Subflow
+              namespace: aira.automations
+              flowId: azure-resource-group-create
+              wait: true
+              retry:
+                type: constant
+                maxAttempts: 3
+                interval: PT10S
+                warningOnRetry: true
+              allowFailure: true
+              transmitFailed: true
+              inputs:
+                parent_execution_id: "{{ execution.id }}"
+          azure-automation-account-create:
+            - id: dispatch_azure_automation_account_create
+              type: io.kestra.plugin.core.flow.Subflow
+              namespace: aira.automations
+              flowId: azure-automation-account-create
+              wait: true
+              retry:
+                type: constant
+                maxAttempts: 3
+                interval: PT10S
+                warningOnRetry: true
+              allowFailure: true
+              transmitFailed: true
+              inputs:
+                parent_execution_id: "{{ execution.id }}"
+          azure-storage-account-create:
+            - id: dispatch_azure_storage_account_create
+              type: io.kestra.plugin.core.flow.Subflow
+              namespace: aira.automations
+              flowId: azure-storage-account-create
+              wait: true
+              retry:
+                type: constant
+                maxAttempts: 3
+                interval: PT10S
+                warningOnRetry: true
+              allowFailure: true
+              transmitFailed: true
+              inputs:
+                parent_execution_id: "{{ execution.id }}"
+        # Reached when AIRA reports an automation as matched and
+        # configured for Kestra dispatch (kestra_flow_id set), but that
+        # exact flow ID has no case above yet -- i.e. a NEW automation
+        # was registered in AIRA without also adding a case here. This
+        # is now a real, required manual step (see this task's own
+        # comment above) -- surfaced as a clear, specific log line
+        # rather than a silent no-op, and write_back's own RUN_STATE
+        # capture (?? 'SKIPPED') already handles this task not
+        # existing under the name it looks for, reporting it to AIRA
+        # as a failed dispatch with an honest reason rather than
+        # pretending it succeeded.
+        defaults:
+          - id: unmapped_automation
+            type: io.kestra.plugin.core.log.Log
+            message: >-
+              AIRA matched automation '{{ outputs.match_automation.vars.intent }}'
+              (kestra_flow_id: '{{ outputs.match_automation.vars.kestra_flow_id }}'),
+              but no case for that flow ID exists in this Switch yet -- add one to
+              run_automation's dispatch_switch task in process-ticket.yml and
+              re-deploy, then re-process this ticket.
+      # Cleanup for stage_params_in_kv above -- runs regardless of which
+      # case fired or whether it succeeded (dispatch_switch's own
+      # allowFailure/defaults already mean this task is always reached
+      # once it's done), so a staged params entry never lingers in the
+      # KV store past the one execution that needed it.
+      # errorOnMissing: false because the defaults: branch above never
+      # actually dispatches anything -- there's still a KV entry to
+      # clean up either way (stage_params_in_kv ran unconditionally),
+      # but being defensive here costs nothing.
+      - id: cleanup_params_kv
+        type: io.kestra.plugin.core.kv.Delete
+        key: "params_json_{{ execution.id }}"
+        namespace: aira
+        errorOnMissing: false
+    else:
+      - id: no_automation_run
+        type: io.kestra.plugin.core.log.Log
+        message: "No automation executed (no match, automation not configured for Kestra dispatch, or rejected/still pending approval). See match_automation's `reason` output for why."
+
+  - id: write_back
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    beforeCommands:
+      - pip install requests --break-system-packages
+    env:
+      SN_URL: "{{ kv('SN_URL') }}"
+      SN_USERNAME: "{{ kv('SN_USERNAME') }}"
+      SN_PASSWORD: "{{ kv('SN_PASSWORD') }}"
+      SYS_ID: "{{ inputs.sys_id }}"
+      TABLE: "{{ inputs.table }}"
+      NUMBER: "{{ inputs.number }}"
+      SHORT_DESCRIPTION: "{{ inputs.short_description ?? '' }}"
+      MATCHED: "{{ outputs.match_automation.vars.matched }}"
+      MATCH_REASON: "{{ outputs.match_automation.vars.reason ?? '' }}"
+      INTENT: "{{ outputs.match_automation.vars.intent ?? '' }}"
+      CONFIDENCE: "{{ outputs.match_automation.vars.confidence ?? '' }}"
+      ASSIGNMENT_GROUP: "{{ outputs.match_automation.vars.assignment_group ?? '' }}"
+      # Confirmed live: this was missing entirely, which is exactly why
+      # the Execution Detail page's "Parameters" card always said "No
+      # parameters were supplied" even when a real automation ran with
+      # real params -- note_pending_approval captures this same value
+      # for its own approval-pending notification, but write_back (the
+      # task that actually reports the FINAL outcome AIRA logs to
+      # execution_logs) never did, so automation_params was always sent
+      # as {} regardless of what actually ran.
+      PARAMS_JSON: "{{ outputs.match_automation.vars.params ?? '' }}"
+      APPROVAL_REQUIRED: "{{ outputs.match_automation.vars.approval_required }}"
+      APPROVAL_STATE: "{{ outputs.wait_for_servicenow_approval.vars.approval_state ?? '' }}"
+      # Points at whichever ONE of dispatch_switch's three distinct
+      # per-case Subflow tasks actually ran (see run_automation's own
+      # comments on why each case has its own id rather than sharing
+      # dispatch_to_matched_automation across branches) -- chained with
+      # ?? exactly like APPROVAL_STATE above handles
+      # wait_for_servicenow_approval possibly never having run at all.
+      # Per Kestra's own Subflow task docs, a Subflow task's outputs are
+      # {executionId, outputs, state} with state as a plain string --
+      # not nested under ".current" (a previous, different bug already
+      # confirmed live: RITM0010063's work note said "Result: SKIPPED"
+      # even after a genuine successful dispatch, from exactly that
+      # wrong nesting).
+      RUN_STATE: "{{ (outputs.dispatch_azure_user_disable.state ?? outputs.dispatch_azure_user_create.state ?? outputs.dispatch_add_user_to_shared_mailbox.state ?? outputs.dispatch_azure_resource_group_create.state ?? outputs.dispatch_azure_automation_account_create.state ?? outputs.dispatch_azure_storage_account_create.state) ?? 'SKIPPED' }}"
+      # Same orchestrator-execution identity as report_processing and
+      # note_pending_approval above -- kept consistent all the way
+      # through so AIRA's stored kestra_execution_id/namespace/flow_id
+      # for this ticket always points at the ONE execution whose Gantt
+      # covers the whole pipeline, from match_automation through
+      # write_back, rather than switching references partway through.
+      EXECUTION_ID: "{{ execution.id }}"
+      FLOW_NAMESPACE: "{{ flow.namespace }}"
+      FLOW_ID: "{{ flow.id }}"
+      AIRA_URL: "{{ kv('AIRA_URL') }}"
+      AIRA_ORCHESTRATOR_KEY: "{{ kv('AIRA_ORCHESTRATOR_KEY') }}"
+    script: |
+      import os, json, requests
+      from datetime import datetime, timezone
+
+      base = os.environ["SN_URL"].replace("__AIRA_COLON__", ":").replace("__AIRA_SLASH__", "/").rstrip("/")  # AIRA may push URLs colon-encoded around a Kestra KV Store bug -- see kestra_agent.py set_kv()
+      auth = (os.environ["SN_USERNAME"], os.environ["SN_PASSWORD"])
+      table = os.environ["TABLE"]
+      matched = os.environ["MATCHED"].lower() == "true"
+      match_reason = os.environ["MATCH_REASON"]
+      try:
+          automation_params = json.loads(os.environ.get("PARAMS_JSON", "") or "{}")
+          if not isinstance(automation_params, dict):
+              automation_params = {}
+      except (ValueError, TypeError):
+          automation_params = {}
+      approval_required = os.environ["APPROVAL_REQUIRED"].lower() == "true"
+      approval_state = os.environ["APPROVAL_STATE"]
+      # Normalized (stripped/uppercased) rather than an exact string
+      # match -- and the RAW value is printed below regardless of
+      # outcome, not just on mismatch, so if Kestra's own Subflow-state
+      # serialization ever differs from the plain "SUCCESS"/"FAILED"
+      # this code expects, that's visible directly in this task's own
+      # Kestra logs instead of silently producing a wrong verdict with
+      # nothing to debug from.
+      run_state_raw = os.environ["RUN_STATE"]
+      run_state = run_state_raw.strip().upper()
+      print(f"dispatch_to_matched_automation reported run_state={run_state_raw!r} (normalized: {run_state!r})")
+
+      # Genuinely successful, unblocked completion: matched, approval (if
+      # any) came back approved, and the dispatched Subflow itself
+      # actually finished in Kestra's SUCCESS state -- not just "was
+      # attempted." Only this case resolves the ticket; every other
+      # branch below only ever adds a work note.
+      automation_succeeded = (
+          matched and run_state == "SUCCESS"
+          and (not approval_required or approval_state == "approved")
+      )
+
+      if not matched:
+          note = f"[Kestra] No automation matched this ticket -- {match_reason or 'left for manual handling.'}"
+      elif approval_required and approval_state == "rejected":
+          note = "[Kestra] Rejected in ServiceNow -- automation was not run."
+      elif approval_required and approval_state != "approved":
+          note = "[Kestra] Approval was not confirmed within the timeout window -- automation was not run."
+      elif automation_succeeded:
+          note = "[Kestra] Automation executed successfully."  # resolve-status suffix appended below, once table is known
+      else:
+          note = f"[Kestra] Automation executed. Result: {run_state}."
+
+      # PATCH body starts as just the work note -- add resolve fields
+      # ONLY on genuine success, and only for tables with well-known
+      # resolve semantics. State/close-code VALUES below are the common
+      # ServiceNow out-of-box defaults, NOT guaranteed to match every
+      # instance -- close_code in particular is very commonly customized
+      # per instance (it's a choice list, and many orgs replace the OOB
+      # options entirely). If resolving fails validation here, check
+      # your instance's actual close_code choice list values and adjust
+      # this dict; the work note itself will still have been sent
+      # separately below regardless of whether the resolve PATCH below
+      # succeeds, so a wrong close_code never means "silently no record
+      # of what happened" -- worst case is a correctly-noted ticket
+      # that's still open, not a silent failure.
+      patch_body = {}
+      if automation_succeeded:
+          if table == "incident":
+              patch_body.update({
+                  "state": "6",  # Resolved (OOB incident.state choice list)
+                  "close_code": "Solved (Permanently)",  # OOB value -- verify against your instance's choice list
+                  "close_notes": note,
+              })
+              note += " Resolving this ticket."
+          elif table == "sc_req_item":
+              patch_body["state"] = "closed_complete"  # OOB sc_req_item.state value
+              note += " Resolving this ticket."
+          else:
+              # sc_request (parent), change_request, or any other/custom
+              # table: resolve semantics vary too much to guess safely --
+              # leave state untouched, work note only. sc_request parents
+              # are typically auto-closed by ServiceNow's own Flow
+              # Designer logic once their child RITMs complete anyway.
+              note += f" (no known auto-resolve mapping for table '{table}' -- left open for manual resolution.)"
+              print(f"No known auto-resolve mapping for table '{table}' -- leaving state untouched, work note only.")
+      patch_body["work_notes"] = note
+
+      write_back_status = "success"
+      write_back_error = ""
+      write_back_at = datetime.now(timezone.utc).isoformat()
+      write_back_exc = None
+      try:
+          resp = requests.patch(
+              f"{base}/api/now/table/{os.environ['TABLE']}/{os.environ['SYS_ID']}",
+              auth=auth, headers={"Accept": "application/json"},
+              json=patch_body,
+              timeout=30,
+          )
+          resp.raise_for_status()
+          print(note)
+      except Exception as e:
+          write_back_status = "failed"
+          write_back_error = str(e)
+          write_back_exc = e
+          print(f"ServiceNow write-back FAILED: {e}")
+
+      # Report the outcome to AIRA's own Ticket History page -- purely
+      # for visibility (see README/SETUP_GUIDE: Kestra never calls back
+      # to AIRA for anything execution-critical elsewhere in this flow,
+      # only /classify, which is read-only). Deliberately best-effort:
+      # wrapped in its own try/except so a failure here can NEVER affect
+      # the ServiceNow outcome above, which has already fully happened
+      # by this point regardless of whether AIRA's own history page
+      # hears about it.
+      if not matched:
+          aira_status = "no_match"
+      elif approval_required and approval_state != "approved":
+          aira_status = "rejected" if approval_state == "rejected" else "pending_approval"
+      elif automation_succeeded:
+          aira_status = "executed"
+      else:
+          aira_status = "failed"
+
+      try:
+          confidence_raw = os.environ.get("CONFIDENCE", "")
+          requests.post(
+              f"{os.environ['AIRA_URL'].replace('__AIRA_COLON__', ':').replace('__AIRA_SLASH__', '/').rstrip('/')}/api/orchestrator/report",
+              headers={"X-Orchestrator-Key": os.environ["AIRA_ORCHESTRATOR_KEY"], "Accept": "application/json"},
+              json={
+                  "ticket_id": os.environ["NUMBER"],
+                  "table": table,
+                  "short_description": os.environ["SHORT_DESCRIPTION"],
+                  "assignment_group": os.environ["ASSIGNMENT_GROUP"],
+                  "intent": os.environ["INTENT"] or None,
+                  "confidence": float(confidence_raw) if confidence_raw else None,
+                  "status": aira_status,
+                  "match_reason": match_reason,
+                  "run_state": run_state,
+                  "params": automation_params,
+                  "kestra_execution_id": os.environ["EXECUTION_ID"],
+                  "kestra_namespace": os.environ["FLOW_NAMESPACE"],
+                  "kestra_flow_id": os.environ["FLOW_ID"],
+                  "write_back_status": write_back_status,
+                  "write_back_note": note,
+                  "write_back_at": write_back_at,
+                  "write_back_error": write_back_error,
+              },
+              timeout=15,
+          )
+      except Exception as e:
+          print(f"Reporting to AIRA's Ticket History failed (non-fatal, ServiceNow was already updated above): {e}")
+
+      # Only now re-raise a genuine write-back failure -- AIRA has
+      # already been told above (write_back_status="failed"), and this
+      # still makes Kestra's own UI correctly show this task as FAILED.
+      if write_back_exc is not None:
+          raise write_back_exc

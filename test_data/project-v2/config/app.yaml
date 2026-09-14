@@ -1,0 +1,3 @@
+debug: false
+max_connections: 25
+timeout_seconds: 30

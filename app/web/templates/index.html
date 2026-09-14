@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local Diff Viewer</title>
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+<div id="app">
+
+  <div class="topbar">
+    <div class="brand"><span class="mark">D</span> Local Diff Viewer</div>
+    <div class="crumb hidden" id="topbar-crumb">
+      <span class="path" id="crumb-left"></span>
+      <span class="sep">&rarr;</span>
+      <span class="path" id="crumb-right"></span>
+    </div>
+    <div class="spacer"></div>
+    <button class="btn ghost small hidden" id="btn-new-comparison">New comparison</button>
+  </div>
+
+  <!-- ================= LANDING VIEW ================= -->
+  <div class="view active" id="view-landing">
+    <div class="landing-inner">
+      <div class="landing-header">
+        <h1>Compare two folders or ZIP files</h1>
+        <p>Works entirely on this machine. No Git required, nothing is uploaded anywhere else.</p>
+      </div>
+
+      <div class="source-grid">
+        <div class="source-card" data-side="left">
+          <div class="side-label">Left source</div>
+          <div class="mode-tabs" data-side="left">
+            <button data-mode="folder" class="active">Folder</button>
+            <button data-mode="zip">ZIP file</button>
+          </div>
+          <div class="dropzone" data-side="left" tabindex="0" role="button" aria-label="Choose left folder or ZIP">
+            <div class="dz-empty">
+              <div class="icon">📁</div>
+              <div class="hint">Drag &amp; drop, or <span class="browse-link">browse</span></div>
+            </div>
+            <button class="btn small icon-only clear-btn hidden" data-side="left" title="Clear">✕</button>
+          </div>
+          <input type="text" class="label-input" data-side="left" placeholder="Label (optional), e.g. project-v1">
+        </div>
+
+        <div class="vs-divider"><span class="arrow">&rarr;</span></div>
+
+        <div class="source-card" data-side="right">
+          <div class="side-label">Right source</div>
+          <div class="mode-tabs" data-side="right">
+            <button data-mode="folder" class="active">Folder</button>
+            <button data-mode="zip">ZIP file</button>
+          </div>
+          <div class="dropzone" data-side="right" tabindex="0" role="button" aria-label="Choose right folder or ZIP">
+            <div class="dz-empty">
+              <div class="icon">📁</div>
+              <div class="hint">Drag &amp; drop, or <span class="browse-link">browse</span></div>
+            </div>
+            <button class="btn small icon-only clear-btn hidden" data-side="right" title="Clear">✕</button>
+          </div>
+          <input type="text" class="label-input" data-side="right" placeholder="Label (optional), e.g. project-v2">
+        </div>
+      </div>
+
+      <div class="options-row">
+        <div class="options-panel">
+          <h3>Ignore patterns (glob, one per line)</h3>
+          <textarea id="ignore-patterns" spellcheck="false">.git/
+__pycache__/
+*.pyc
+node_modules/
+.venv/
+dist/
+build/
+*.log
+.DS_Store</textarea>
+        </div>
+        <div class="options-panel">
+          <h3>Comparison options</h3>
+          <div class="check-list">
+            <div class="check-row"><input type="checkbox" id="opt-detect-renames" checked><label for="opt-detect-renames">Detect renamed files</label></div>
+            <div class="check-row"><input type="checkbox" id="opt-ignore-whitespace"><label for="opt-ignore-whitespace">Ignore whitespace changes</label></div>
+            <div class="check-row"><input type="checkbox" id="opt-ignore-blank-lines"><label for="opt-ignore-blank-lines">Ignore blank lines</label></div>
+            <div class="check-row"><input type="checkbox" id="opt-ignore-case"><label for="opt-ignore-case">Ignore case</label></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="compare-cta">
+        <button class="btn primary" id="btn-compare" disabled>Compare</button>
+        <div class="error hidden" id="compare-error"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= SUMMARY VIEW ================= -->
+  <div class="view" id="view-summary">
+    <div class="summary-card">
+      <div class="title">Comparison complete</div>
+      <div class="pair">
+        <span id="summary-left"></span><span class="arrow">&rarr;</span><span id="summary-right"></span>
+      </div>
+      <div class="meta" id="summary-meta"></div>
+
+      <div class="diffstat-bar" id="diffstat-bar"></div>
+
+      <div class="summary-grid">
+        <div class="summary-stat added"><div class="n" id="stat-added">0</div><div class="l">Added</div></div>
+        <div class="summary-stat deleted"><div class="n" id="stat-deleted">0</div><div class="l">Deleted</div></div>
+        <div class="summary-stat modified"><div class="n" id="stat-modified">0</div><div class="l">Modified</div></div>
+        <div class="summary-stat renamed"><div class="n" id="stat-renamed">0</div><div class="l">Renamed</div></div>
+        <div class="summary-stat unchanged"><div class="n" id="stat-unchanged">0</div><div class="l">Unchanged</div></div>
+      </div>
+
+      <div class="summary-actions">
+        <button class="btn primary" id="btn-open-explorer">Open diff explorer</button>
+        <button class="btn" id="btn-export-json">Export JSON</button>
+        <button class="btn" id="btn-export-html">Export HTML report</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= EXPLORER VIEW ================= -->
+  <div class="view" id="view-explorer">
+    <div class="explorer-header">
+      <div class="stats" id="explorer-stats"></div>
+      <div class="spacer"></div>
+      <div class="search-box">
+        <span>🔍</span>
+        <input type="text" id="global-search" placeholder="Search files and content...">
+        <span class="k">/</span>
+      </div>
+      <button class="btn small" id="btn-export-json-2">Export JSON</button>
+      <button class="btn small" id="btn-export-html-2">Export HTML</button>
+    </div>
+
+    <div class="explorer-body">
+      <div class="sidebar" id="sidebar">
+        <div class="sidebar-tabs">
+          <button class="active" data-tab="tree">Tree</button>
+          <button data-tab="list">List</button>
+        </div>
+
+        <div class="filter-row" id="filter-row">
+          <button class="filter-chip active" data-status="all">All</button>
+          <button class="filter-chip" data-status="modified"><span class="dot" style="background:var(--mod)"></span>Modified</button>
+          <button class="filter-chip" data-status="added"><span class="dot" style="background:var(--add)"></span>Added</button>
+          <button class="filter-chip" data-status="deleted"><span class="dot" style="background:var(--del)"></span>Deleted</button>
+          <button class="filter-chip" data-status="renamed"><span class="dot" style="background:var(--ren)"></span>Renamed</button>
+          <button class="filter-chip" data-status="unchanged"><span class="dot" style="background:var(--unc)"></span>Unchanged</button>
+        </div>
+
+        <div class="mini-checks">
+          <div class="check-row"><input type="checkbox" id="opt-hide-unchanged"><label for="opt-hide-unchanged">Hide unchanged files</label></div>
+        </div>
+
+        <div class="tree-scroll" id="tree-scroll"></div>
+        <div class="filelist-scroll hidden" id="filelist-scroll"></div>
+      </div>
+
+      <div class="diff-panel">
+        <div class="diff-panel-header hidden" id="diff-header">
+          <span class="status-pill" id="diff-status-pill"></span>
+          <span class="file-path" id="diff-file-path"></span>
+          <span class="stat-inline" id="diff-stat-inline"></span>
+          <div class="spacer"></div>
+          <div class="diff-nav">
+            <button class="btn small icon-only" id="btn-prev-change" title="Previous change">↑</button>
+            <button class="btn small icon-only" id="btn-next-change" title="Next change">↓</button>
+          </div>
+          <div class="view-toggle">
+            <button class="active" data-mode="side-by-side">Side-by-Side</button>
+            <button data-mode="unified">Unified</button>
+          </div>
+        </div>
+        <div class="diff-scroll" id="diff-scroll">
+          <div class="diff-empty">
+            <div class="icon">🗂️</div>
+            <div>Select a file on the left to view its diff</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div id="loading-overlay">
+  <div class="spinner"></div>
+  <div class="loading-text" id="loading-text">Comparing…</div>
+</div>
+
+<input type="file" id="file-input-folder" webkitdirectory multiple class="hidden">
+<input type="file" id="file-input-zip" accept=".zip" class="hidden">
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
