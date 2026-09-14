@@ -8,6 +8,8 @@ UI — without Git. Compare any combination of:
 - Folder vs ZIP
 - ZIP vs Folder
 
+![App Screenshot](appscreen.png)
+
 Everything runs on your machine. Nothing is uploaded to any external service; the
 "upload" you see in the browser is just the browser sending your files to the local
 Python server running on `127.0.0.1`.
